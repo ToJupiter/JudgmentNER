@@ -1,12 +1,15 @@
 import asyncio
 import json
 import os
+import sqlite3
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 load_dotenv()
 
-INPUT_FILE = "/media/rocminfo/565A28A25A2880BB/VBPL/CBBACrawl/banan_txt/output_json"
+DB_PATH = "/media/rocminfo/565A28A25A2880BB/VBPL/CBBACrawl/banan_txt/labeled.db"
+
+INPUT_FILE = "/media/rocminfo/565A28A25A2880BB/VBPL/CBBACrawl/banan_txt/output_json/june6_laws.json"
 OUTPUT_FILE = "/media/rocminfo/565A28A25A2880BB/VBPL/CBBACrawl/banan_txt/output_json/june5_labeled.jsonl"
 MODEL_NAME = "deepseek-v4-flash"
 MAX_CONCURRENT = 128
@@ -100,6 +103,23 @@ async def label_one(sem, entry_index, law_index, text):
             return entry_index, law_index, f"ERROR: {str(e)}", None
 
 async def main():
+    # Initialise SQLite connection
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS labeled_citations (
+            file_name   TEXT NOT NULL,
+            entry_index INTEGER NOT NULL,
+            law_index   INTEGER NOT NULL,
+            input_text  TEXT NOT NULL,
+            output_text TEXT NOT NULL,
+            usage_json  TEXT,
+            created_at  TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (file_name, entry_index, law_index)
+        )
+    """)
+    conn.commit()
+
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -135,9 +155,30 @@ async def main():
             }, ensure_ascii=False) + "\n")
             out.flush()
 
+            # SQLite insert
+            usage_json = json.dumps(usage) if usage else None
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO labeled_citations "
+                    "(file_name, entry_index, law_index, input_text, output_text, usage_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        entry.get("file_name", ""),
+                        entry_idx,
+                        law_idx,
+                        entry["laws_cited"][law_idx],
+                        raw,
+                        usage_json
+                    )
+                )
+                conn.commit()
+            except Exception as e:
+                print(f"SQLite write error: {e}")
+
             if completed % 1000 == 0:
                 print(f"Progress: {completed}/{total}")
 
+    conn.close()
     print("Labelling complete. Output written to", OUTPUT_FILE)
 
 if __name__ == "__main__":
