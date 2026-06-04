@@ -13,3 +13,5 @@ wheels/
 *.log
 banan_txt/
 output_banan_async/
+TestLatex/
+.env/
