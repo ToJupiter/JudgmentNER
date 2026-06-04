@@ -11,3 +11,5 @@ wheels/
 *.pdf
 *.db
 *.log
+banan_txt/
+output_banan_async/
