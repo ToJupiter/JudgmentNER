@@ -1,0 +1,2 @@
+#  NER on Vietnamese court judgment with CNN:
+1. As a replacement for complex large language model with high inference time, we utilize the labelling strategy with DeepSeek LLM and then train a small CNN model with inference time of a few miliseconds for the regex-ed input.
