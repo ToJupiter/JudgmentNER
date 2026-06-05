@@ -11,7 +11,7 @@ load_dotenv()
 
 DB_PATH = "banan_txt/output_json/labeled.db"
 INPUT_FILE = "banan_txt/output_json/june6_laws_filtered.json"
-OUTPUT_FILE = "banan_txt/output_json/june6_labeled.jsonl"
+OUTPUT_FILE = "banan_txt/output_json/june7_labeled.jsonl"
 MODEL_NAME = "deepseek-v4-flash"
 MAX_CONCURRENT = 128
 
@@ -128,6 +128,7 @@ async def label_one(sem, entry_index, law_index, text, tokens, original_text):
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": text}
                 ],
+                extra_body={"thinking": {"type": "disabled"}},
                 max_tokens=2048,
                 temperature=0.3,
                 stream=False
