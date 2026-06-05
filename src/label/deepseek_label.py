@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import os
@@ -83,6 +84,12 @@ Output: ART: 14 | LAW: Nghị định số 91/2019/NĐ- CP ngày 19/11/2019 củ
 
 client = AsyncOpenAI(api_key=os.environ["DEEPSEEK_API_KEY"], base_url="https://api.deepseek.com")
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Label legal citations with optional resume support.")
+    parser.add_argument("--resume", action="store_true", help="Skip rows already present in the SQLite database")
+    return parser.parse_args()
+
 async def label_one(sem, entry_index, law_index, text):
     async with sem:
         try:
@@ -102,7 +109,7 @@ async def label_one(sem, entry_index, law_index, text):
         except Exception as e:
             return entry_index, law_index, f"ERROR: {str(e)}", None
 
-async def main():
+async def main(resume=False):
     # Initialise SQLite connection
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -120,6 +127,12 @@ async def main():
     """)
     conn.commit()
 
+    completed_keys = set()
+    if resume:
+        cursor = conn.execute("SELECT file_name, entry_index, law_index FROM labeled_citations")
+        completed_keys = set((row[0], row[1], row[2]) for row in cursor.fetchall())
+        print(f"Found {len(completed_keys)} already labelled entries – will skip them")
+
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -132,7 +145,14 @@ async def main():
     tasks = []
     for i, entry in enumerate(items):
         for j, law_text in enumerate(entry.get("laws_cited", [])):
+            if resume and (entry.get("file_name", ""), i, j) in completed_keys:
+                continue
             tasks.append(label_one(sem, i, j, law_text))
+
+    if not tasks:
+        print("All entries already labelled. Nothing to do.")
+        conn.close()
+        return
 
     results = {}
     completed = 0
@@ -182,4 +202,5 @@ async def main():
     print("Labelling complete. Output written to", OUTPUT_FILE)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    args = parse_args()
+    asyncio.run(main(resume=args.resume))
