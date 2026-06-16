@@ -10,12 +10,16 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 
 
 def tokenize(text: str) -> List[str]:
     tokens = re.findall(r'\w+|[^\w\s]', text)
     return tokens
+
+
+def normalize_law_name(name: str) -> str:
+    return name.strip().rstrip('.,;: ').lower()
 
 
 def find_substring_span(text: str, substring: str, ignore_case: bool = True) -> Optional[Tuple[int, int]]:
@@ -59,9 +63,81 @@ def build_vocab(sentences: List[List[str]], min_freq: int = 2):
     return word2idx, char2idx
 
 
+def load_law_database(csv_path: str):
+    import csv
+    titles = []
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        next(reader)
+        for row in reader:
+            if row:
+                titles.append(row[0].strip().strip('"'))
+    print(f"[LAW DB] Loaded {len(titles)} titles")
+    return titles
+
+
+def match_law_and_articles(entry: Dict, tokens: List[str], token_spans: List[Tuple[int, int]], text: str):
+    tags = ["O"] * len(tokens)
+    errors = []
+
+    for cit in entry["citations"]:
+        law_raw = cit["law"]
+        articles = cit["articles"]
+
+        span_char = find_substring_span(text, law_raw, ignore_case=False)
+        if span_char is None:
+            span_char = find_substring_span(text, law_raw.rstrip('.,;: '), ignore_case=False)
+        if span_char is None:
+            span_char = find_substring_span(text, law_raw, ignore_case=True)
+        if span_char is None:
+            span_char = find_substring_span(text, law_raw.rstrip('.,;: '), ignore_case=True)
+        if span_char is None:
+            errors.append(f"Law span not found: {law_raw}")
+            continue
+
+        start_c, end_c = span_char
+        law_indices = [i for i, (s, e) in enumerate(token_spans) if e > start_c and s < end_c]
+        if not law_indices:
+            errors.append(f"Law token indices empty: {law_raw}")
+            continue
+
+        for idx_i, tidx in enumerate(law_indices):
+            tags[tidx] = "B-LAW" if idx_i == 0 else "I-LAW"
+
+        for art in articles:
+            art_token_idx = None
+            for i, t in enumerate(tokens):
+                clean_t = t.strip('.,;:()[]{}')
+                if clean_t == art:
+                    art_token_idx = i
+                    break
+            if art_token_idx is None:
+                for i, t in enumerate(tokens):
+                    if t == art:
+                        art_token_idx = i
+                        break
+            if art_token_idx is None:
+                errors.append(f"Article number token not found: {art}")
+                continue
+
+            dieu_found = False
+            for j in range(art_token_idx - 1, -1, -1):
+                if tokens[j].lower() == "điều" and tags[j] == "O":
+                    tags[j] = "B-ART"
+                    dieu_found = True
+                    break
+            if dieu_found:
+                tags[art_token_idx] = "I-ART"
+            else:
+                tags[art_token_idx] = "B-ART"
+
+    return tags, errors
+
+
 def prepare_data(jsonl_files: List[str], law_csv: Optional[str] = None):
     entries = []
     file_stats = {}
+
     for fname in jsonl_files:
         count = 0
         with open(fname, 'r', encoding='utf-8') as f:
@@ -80,9 +156,10 @@ def prepare_data(jsonl_files: List[str], law_csv: Optional[str] = None):
         print(f"[DATA] File {fname}: {count} valid entries with citations")
 
     total_before_dedup = len(entries)
-    print(f"[DATA] Total entries with citations before dedup: {total_before_dedup}")
+    print(f"[DATA] Total entries before dedup: {total_before_dedup}")
 
-    key_fn = lambda e: (e.get("file_name", ""), e.get("entry_index", -1), e.get("law_index", -1))
+    def key_fn(e):
+        return (e.get("file_name", ""), e.get("entry_index", -1), e.get("law_index", -1))
     unique_entries = {}
     duplicates = 0
     for entry in entries:
@@ -91,7 +168,7 @@ def prepare_data(jsonl_files: List[str], law_csv: Optional[str] = None):
             unique_entries[key] = entry
         else:
             duplicates += 1
-    print(f"[DATA] Dedup based on (file_name, entry_index, law_index): {duplicates} duplicates removed, {len(unique_entries)} unique entries")
+    print(f"[DATA] Dedup by (file_name, entry_index, law_index): removed {duplicates} duplicates, {len(unique_entries)} unique")
 
     samples = []
     fail_reasons = Counter()
@@ -101,67 +178,21 @@ def prepare_data(jsonl_files: List[str], law_csv: Optional[str] = None):
         inp = entry["input"]
         tokens = tokenize(inp)
         token_spans = char_to_token_spans(tokens, inp)
-        tags = ["O"] * len(tokens)
-
-        success = True
-        for cit in entry["citations"]:
-            law_str = cit["law"]
-            articles = cit["articles"]
-
-            law_span_char = None
-            law_span_char = find_substring_span(inp, law_str, ignore_case=False)
-            if law_span_char is None:
-                law_clean = law_str.rstrip('.,;: ')
-                law_span_char = find_substring_span(inp, law_clean, ignore_case=False)
-            if law_span_char is None:
-                law_span_char = find_substring_span(inp, law_str, ignore_case=True)
-                if law_span_char is None:
-                    law_span_char = find_substring_span(inp, law_str.rstrip('.,;: '), ignore_case=True)
-            if law_span_char is None:
-                success = False
-                fail_reasons["law_span_not_found"] += 1
-                break
-
-            start_c, end_c = law_span_char
-            law_token_indices = []
-            for i, (s, e) in enumerate(token_spans):
-                if e > start_c and s < end_c:
-                    law_token_indices.append(i)
-            if not law_token_indices:
-                success = False
-                fail_reasons["law_token_indices_empty"] += 1
-                break
-
-            for idx_i, tidx in enumerate(law_token_indices):
-                if idx_i == 0:
-                    tags[tidx] = "B-LAW"
-                else:
-                    tags[tidx] = "I-LAW"
-
-            art_found_count = 0
-            for art in articles:
-                art_token_idx = None
-                for i, t in enumerate(tokens):
-                    clean_t = t.strip('.,;:')
-                    if clean_t == art:
-                        art_token_idx = i
-                        break
-                if art_token_idx is not None:
-                    tags[art_token_idx] = "B-ART"
-                    art_found_count += 1
-            if art_found_count != len(articles):
-                pass
-        if not success:
+        tags, errors = match_law_and_articles(entry, tokens, token_spans, inp)
+        if errors:
+            for err in errors:
+                fail_reasons[err] += 1
             continue
-        samples.append((tokens, tags))
+        samples.append((tokens, tags, inp))
         success_count += 1
 
-    print(f"[DATA] Successfully tagged samples: {success_count}")
+    print(f"[DATA] Successfully tagged: {success_count}")
     if fail_reasons:
-        print(f"[DATA] Failure reasons: {dict(fail_reasons)}")
-    if len(samples) > 0:
-        print(f"[DATA] Example tagged sentence (first 5):")
-        for tokens, tags in samples[:5]:
+        print(f"[DATA] Top failure reasons: {fail_reasons.most_common(15)}")
+    if samples:
+        print("[DATA] First 3 tagged samples:")
+        for tokens, tags, inp in samples[:3]:
+            print(f"  Input: {inp}")
             print(f"  Tokens: {tokens}")
             print(f"  Tags:   {tags}")
     return samples
@@ -179,7 +210,7 @@ class NERDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        tokens, tags = self.samples[idx]
+        tokens, tags, _ = self.samples[idx]
         word_ids = [self.word2idx.get(t, self.word2idx["<UNK>"]) for t in tokens]
         char_ids = []
         for w in tokens:
@@ -216,20 +247,20 @@ class CharCNN(nn.Module):
         return char_feat.view(B, S, -1)
 
 
-class CNN_NER(nn.Module):
+class CNNBiLSTM_NER(nn.Module):
     def __init__(self, word_vocab_size, char_vocab_size, tag_size,
-                 word_emb_dim=100, char_emb_dim=25, num_filters=30,
-                 hidden_dim=64, dropout=0.3, pad_idx=0):
+                 word_emb_dim=64, char_emb_dim=25, num_filters=30,
+                 lstm_hidden_dim=64, dropout=0.3, pad_idx=0):
         super().__init__()
         self.word_embed = nn.Embedding(word_vocab_size, word_emb_dim, padding_idx=pad_idx)
-        self.char_cnn = CharCNN(char_vocab_size, char_emb_dim, num_filters)
+        self.char_cnn = CharCNN(char_vocab_size, char_emb_dim, num_filters, pad_idx=pad_idx)
+        self.input_dim = word_emb_dim + num_filters
         self.dropout_emb = nn.Dropout(dropout)
-        input_dim = word_emb_dim + num_filters
-        self.conv1 = nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
-        self.activation = nn.ReLU()
-        self.dropout_cnn = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_dim, tag_size)
+
+        self.lstm = nn.LSTM(self.input_dim, lstm_hidden_dim, num_layers=1,
+                            bidirectional=True, batch_first=True)
+        self.dropout_lstm = nn.Dropout(dropout)
+        self.fc = nn.Linear(lstm_hidden_dim * 2, tag_size)
 
     def forward(self, word_ids, char_ids, lengths):
         word_emb = self.word_embed(word_ids)
@@ -237,12 +268,11 @@ class CNN_NER(nn.Module):
         combined = torch.cat([word_emb, char_feat], dim=-1)
         combined = self.dropout_emb(combined)
 
-        x = combined.permute(0, 2, 1)
-        x = self.activation(self.conv1(x))
-        x = self.dropout_cnn(x)
-        x = self.activation(self.conv2(x))
-        x = x.permute(0, 2, 1)
-        logits = self.fc(x)
+        packed_input = pack_padded_sequence(combined, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        packed_output, _ = self.lstm(packed_input)
+        lstm_out, _ = pad_packed_sequence(packed_output, batch_first=True)
+        lstm_out = self.dropout_lstm(lstm_out)
+        logits = self.fc(lstm_out)
         return logits
 
 
@@ -257,30 +287,19 @@ def compute_metrics(true_tags_list, pred_tags_list):
                 continue
             else:
                 if start is not None:
-                    spans.add((start, i-1))
+                    spans.add((start, i - 1))
                     start = None
         if start is not None:
-            spans.add((start, len(tags)-1))
+            spans.add((start, len(tags) - 1))
         return spans
 
     law_tp = law_fp = law_fn = 0
     art_tp = art_fp = art_fn = 0
-    total_true_law = 0
-    total_true_art = 0
-    total_pred_law = 0
-    total_pred_art = 0
-
     for t_tags, p_tags in zip(true_tags_list, pred_tags_list):
         t_law = get_spans(t_tags, "LAW")
         p_law = get_spans(p_tags, "LAW")
         t_art = get_spans(t_tags, "ART")
         p_art = get_spans(p_tags, "ART")
-
-        total_true_law += len(t_law)
-        total_true_art += len(t_art)
-        total_pred_law += len(p_law)
-        total_pred_art += len(p_art)
-
         law_tp += len(t_law & p_law)
         law_fp += len(p_law - t_law)
         law_fn += len(t_law - p_law)
@@ -296,22 +315,17 @@ def compute_metrics(true_tags_list, pred_tags_list):
 
     law_prec, law_rec, law_f1 = prf(law_tp, law_fp, law_fn)
     art_prec, art_rec, art_f1 = prf(art_tp, art_fp, art_fn)
-
-    return {
-        "law_precision": law_prec, "law_recall": law_rec, "law_f1": law_f1,
-        "art_precision": art_prec, "art_recall": art_rec, "art_f1": art_f1,
-        "law_true_count": total_true_law, "law_pred_count": total_pred_law,
-        "art_true_count": total_true_art, "art_pred_count": total_pred_art,
-    }
+    return {"law_prec": law_prec, "law_rec": law_rec, "law_f1": law_f1,
+            "art_prec": art_prec, "art_rec": art_rec, "art_f1": art_f1,
+            "law_tp": law_tp, "law_fp": law_fp, "law_fn": law_fn,
+            "art_tp": art_tp, "art_fp": art_fp, "art_fn": art_fn}
 
 
 def evaluate(model, dataloader, idx2tag, device, detailed=True):
     model.eval()
     total_loss = 0.0
-    all_true_tags = []
-    all_pred_tags = []
-    token_correct = 0
-    token_total = 0
+    all_true_tags, all_pred_tags = [], []
+    token_correct, token_total = 0, 0
     criterion = nn.CrossEntropyLoss(ignore_index=0)
     with torch.no_grad():
         for word_ids, char_ids, tag_ids, lengths in dataloader:
@@ -321,12 +335,10 @@ def evaluate(model, dataloader, idx2tag, device, detailed=True):
             logits = model(word_ids, char_ids, lengths)
             loss = criterion(logits.view(-1, logits.shape[-1]), tag_ids.view(-1))
             total_loss += loss.item() * word_ids.size(0)
-
             preds = torch.argmax(logits, dim=-1)
             mask = (tag_ids != 0)
             token_correct += (preds == tag_ids).masked_select(mask).sum().item()
             token_total += mask.sum().item()
-
             preds_cpu = preds.cpu().numpy()
             tags_cpu = tag_ids.cpu().numpy()
             for i in range(len(lengths)):
@@ -335,31 +347,29 @@ def evaluate(model, dataloader, idx2tag, device, detailed=True):
                 t_tags = [idx2tag[t] for t in tags_cpu[i][:l]]
                 all_true_tags.append(t_tags)
                 all_pred_tags.append(p_tags)
-
     avg_loss = total_loss / len(dataloader.dataset)
     token_acc = token_correct / token_total if token_total > 0 else 0.0
     metrics = compute_metrics(all_true_tags, all_pred_tags)
-
     if detailed:
-        print(f"  Token accuracy: {token_acc:.4f}")
-        print(f"  LAW - Precision: {metrics['law_precision']:.4f}, Recall: {metrics['law_recall']:.4f}, F1: {metrics['law_f1']:.4f} | True: {metrics['law_true_count']}, Pred: {metrics['law_pred_count']}")
-        print(f"  ART - Precision: {metrics['art_precision']:.4f}, Recall: {metrics['art_recall']:.4f}, F1: {metrics['art_f1']:.4f} | True: {metrics['art_true_count']}, Pred: {metrics['art_pred_count']}")
+        print(f"  Token acc: {token_acc:.4f}")
+        print(f"  LAW - P: {metrics['law_prec']:.4f}, R: {metrics['law_rec']:.4f}, F1: {metrics['law_f1']:.4f} (tp:{metrics['law_tp']}, fp:{metrics['law_fp']}, fn:{metrics['law_fn']})")
+        print(f"  ART - P: {metrics['art_prec']:.4f}, R: {metrics['art_rec']:.4f}, F1: {metrics['art_f1']:.4f} (tp:{metrics['art_tp']}, fp:{metrics['art_fp']}, fn:{metrics['art_fn']})")
     return avg_loss, token_acc, metrics
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--jsonl_files', nargs='+', required=True,
-                        help='List of JSONL files')
-    parser.add_argument('--law_csv', default=None,
-                        help='Optional law title CSV for post-processing demo')
+    parser.add_argument('--jsonl_files', nargs='+', required=True)
+    parser.add_argument('--law_csv', default=None)
     parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--sample_output', default=None, help='Output file for tokenisation samples')
+    parser.add_argument('--sample_count', type=int, default=200)
     args = parser.parse_args()
 
-    print(f"[CONFIG] Epochs: {args.epochs}, Batch size: {args.batch_size}, LR: {args.lr}, Seed: {args.seed}")
+    print(f"[CONFIG] Epochs: {args.epochs}, Batch: {args.batch_size}, LR: {args.lr}, Seed: {args.seed}")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -368,11 +378,24 @@ def main():
     print(f"[DEVICE] Using: {device}")
     if device.type == 'cuda':
         print(f"[DEVICE] GPU: {torch.cuda.get_device_name(0)}")
-        print(f"[DEVICE] Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+
+    law_titles = None
+    if args.law_csv:
+        law_titles = load_law_database(args.law_csv)
 
     samples = prepare_data(args.jsonl_files, args.law_csv)
-    if len(samples) == 0:
+    if not samples:
         raise ValueError("No valid samples found. Check your data.")
+
+    if args.sample_output and args.sample_count > 0:
+        count = min(args.sample_count, len(samples))
+        with open(args.sample_output, 'w', encoding='utf-8') as f:
+            for i in range(count):
+                tokens, tags, inp = samples[i]
+                f.write(f"Input: {inp}\n")
+                f.write(f"Tokens: {' '.join(tokens)}\n")
+                f.write(f"Tags:   {' '.join(tags)}\n\n")
+        print(f"[SAMPLE] Wrote {count} tokenisation samples to {args.sample_output}")
 
     random.shuffle(samples)
     n = len(samples)
@@ -383,9 +406,8 @@ def main():
     test_samples = samples[val_end:]
     print(f"[SPLIT] Train: {len(train_samples)}, Val: {len(val_samples)}, Test: {len(test_samples)}")
 
-    train_sents = [tokens for tokens, _ in train_samples]
+    train_sents = [tok for tok, _, _ in train_samples]
     word2idx, char2idx = build_vocab(train_sents, min_freq=2)
-
     tag2idx = {"O": 0, "B-LAW": 1, "I-LAW": 2, "B-ART": 3, "I-ART": 4}
     idx2tag = {v: k for k, v in tag2idx.items()}
 
@@ -397,21 +419,22 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
-    model = CNN_NER(len(word2idx), len(char2idx), len(tag2idx))
+    model = CNNBiLSTM_NER(len(word2idx), len(char2idx), len(tag2idx))
     model.to(device)
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[MODEL] Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
+    total_p = sum(p.numel() for p in model.parameters())
+    trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[MODEL] CNNBiLSTM - Total params: {total_p:,}, Trainable: {trainable_p:,}")
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
     criterion = nn.CrossEntropyLoss(ignore_index=0)
 
     best_val_f1 = 0.0
-    for epoch in range(1, args.epochs+1):
+    for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
-        train_token_correct = 0
-        train_token_total = 0
+        train_correct = 0
+        train_total = 0
         for word_ids, char_ids, tag_ids, lengths in train_loader:
             word_ids = word_ids.to(device)
             char_ids = char_ids.to(device)
@@ -421,79 +444,61 @@ def main():
             loss = criterion(logits.view(-1, logits.shape[-1]), tag_ids.view(-1))
             loss.backward()
             optimizer.step()
-
             total_loss += loss.item() * word_ids.size(0)
             preds = torch.argmax(logits, dim=-1)
             mask = (tag_ids != 0)
-            train_token_correct += (preds == tag_ids).masked_select(mask).sum().item()
-            train_token_total += mask.sum().item()
+            train_correct += (preds == tag_ids).masked_select(mask).sum().item()
+            train_total += mask.sum().item()
+        train_loss = total_loss / len(train_ds)
+        train_acc = train_correct / train_total if train_total > 0 else 0.0
+        print(f"[EPOCH {epoch:2d}] Train loss: {train_loss:.4f}, token acc: {train_acc:.4f}")
 
-        avg_train_loss = total_loss / len(train_ds)
-        train_token_acc = train_token_correct / train_token_total if train_token_total > 0 else 0.0
-
-        print(f"[EPOCH {epoch:3d}] Train loss: {avg_train_loss:.4f}, Train token acc: {train_token_acc:.4f}")
-
-        print("[VAL] Validation results:")
         val_loss, val_acc, val_metrics = evaluate(model, val_loader, idx2tag, device, detailed=True)
-        avg_val_f1 = (val_metrics['law_f1'] + val_metrics['art_f1']) / 2
-        print(f"  Val loss: {val_loss:.4f}, avg F1: {avg_val_f1:.4f}")
+        val_f1 = (val_metrics['law_f1'] + val_metrics['art_f1']) / 2
+        print(f"  Val loss: {val_loss:.4f}, avg F1: {val_f1:.4f}")
+        scheduler.step(val_f1)
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            torch.save(model.state_dict(), "best_model.pt")
+            print("  ** Saved best model **")
 
-        if avg_val_f1 > best_val_f1:
-            best_val_f1 = avg_val_f1
-            torch.save(model.state_dict(), "best_ner.pt")
-            print(f"  ** New best model saved (avg F1: {best_val_f1:.4f}) **")
-
-    print("\n" + "="*50)
-    print("[TEST] Final test evaluation:")
-    model.load_state_dict(torch.load("best_ner.pt"))
+    print("\n" + "=" * 50)
+    print("[TEST] Final evaluation:")
+    model.load_state_dict(torch.load("best_model.pt"))
     test_loss, test_acc, test_metrics = evaluate(model, test_loader, idx2tag, device, detailed=True)
-    print(f"  Test loss: {test_loss:.4f}, Token acc: {test_acc:.4f}")
 
-    if args.law_csv:
-        print("\n" + "="*50)
-        print("[POST-PROCESS] Law title matching demo")
-        import csv
+    if args.law_csv and law_titles:
+        print("\n[POST-PROCESS] Law title matching examples:")
         from difflib import get_close_matches
-        law_titles = []
-        with open(args.law_csv, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f)
-            next(reader)
-            for row in reader:
-                if row:
-                    law_titles.append(row[0].strip())
-        print(f"[POST-PROCESS] Loaded {len(law_titles)} law titles from CSV")
 
-        def match_law(predicted_name, title_list, cutoff=0.8):
-            matches = get_close_matches(predicted_name, title_list, n=1, cutoff=cutoff)
-            return matches[0] if matches else predicted_name
+        def match_law(pred_name, title_list, cutoff=0.8):
+            if not pred_name:
+                return ""
+            matches = get_close_matches(pred_name, title_list, n=1, cutoff=cutoff)
+            return matches[0] if matches else pred_name
 
         model.eval()
-        demo_count = min(5, len(test_samples))
-        print(f"[POST-PROCESS] Displaying {demo_count} examples:")
+        demo_n = min(5, len(test_samples))
         with torch.no_grad():
-            for i in range(demo_count):
-                tokens, true_tags = test_samples[i]
+            for i in range(demo_n):
+                tokens, true_tags, inp = test_samples[i]
                 word_ids, char_ids, tag_ids, lengths = test_ds[i]
                 word_ids = word_ids.unsqueeze(0).to(device)
                 char_ids = char_ids.unsqueeze(0).to(device)
                 logits = model(word_ids, char_ids, torch.tensor([lengths]))
                 pred_ids = torch.argmax(logits, dim=-1).squeeze(0).cpu().numpy()
                 pred_tags = [idx2tag[p] for p in pred_ids[:lengths]]
-
-                law_tokens = []
-                for t, ptag in zip(tokens, pred_tags):
-                    if ptag in ("B-LAW", "I-LAW"):
-                        law_tokens.append(t)
+                law_tokens = [t for t, ptag in zip(tokens, pred_tags) if ptag in ("B-LAW", "I-LAW")]
                 raw_law = " ".join(law_tokens)
-                matched = match_law(raw_law, law_titles) if raw_law else ""
-                print(f"  Input: {' '.join(tokens)}")
-                print(f"    True tags: {true_tags}")
-                print(f"    Pred tags: {pred_tags}")
-                print(f"    Pred law: '{raw_law}' -> matched: '{matched}'")
+                matched = match_law(raw_law, law_titles)
+                print(f"  Input: {inp}")
+                print(f"    True: {true_tags}")
+                print(f"    Pred: {pred_tags}")
+                print(f"    Law prediction: '{raw_law}' -> matched: '{matched}'")
                 print()
 
     if device.type == 'cuda':
-        print(f"\n[DEVICE] Peak GPU memory allocated: {torch.cuda.max_memory_allocated(0) / 1024**2:.2f} MB")
+        print(f"[DEVICE] Peak GPU memory: {torch.cuda.max_memory_allocated(0) / 1024 ** 2:.2f} MB")
 
 
 if __name__ == "__main__":
