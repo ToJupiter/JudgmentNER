@@ -224,7 +224,7 @@ class NERDataset(Dataset):
 def collate_fn(batch):
     word_ids, char_ids, tag_ids, lengths = zip(*batch)
     word_pad = pad_sequence(word_ids, batch_first=True, padding_value=0)
-    tag_pad = pad_sequence(tag_ids, batch_first=True, padding_value=0)
+    tag_pad = pad_sequence(tag_ids, batch_first=True, padding_value=0)     
     char_pad = pad_sequence(char_ids, batch_first=True, padding_value=0)
     lengths = torch.tensor(lengths)
     return word_pad, char_pad, tag_pad, lengths
@@ -408,7 +408,8 @@ def main():
 
     train_sents = [tok for tok, _, _ in train_samples]
     word2idx, char2idx = build_vocab(train_sents, min_freq=2)
-    tag2idx = {"O": 0, "B-LAW": 1, "I-LAW": 2, "B-ART": 3, "I-ART": 4}
+
+    tag2idx = {"<PAD>": 0, "O": 1, "B-LAW": 2, "I-LAW": 3, "B-ART": 4, "I-ART": 5}
     idx2tag = {v: k for k, v in tag2idx.items()}
 
     train_ds = NERDataset(train_samples, word2idx, char2idx, tag2idx)
@@ -446,7 +447,7 @@ def main():
             optimizer.step()
             total_loss += loss.item() * word_ids.size(0)
             preds = torch.argmax(logits, dim=-1)
-            mask = (tag_ids != 0)
+            mask = (tag_ids != 0) 
             train_correct += (preds == tag_ids).masked_select(mask).sum().item()
             train_total += mask.sum().item()
         train_loss = total_loss / len(train_ds)
