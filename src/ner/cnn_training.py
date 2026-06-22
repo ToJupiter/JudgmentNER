@@ -408,6 +408,11 @@ def main():
 
     train_sents = [tok for tok, _, _ in train_samples]
     word2idx, char2idx = build_vocab(train_sents, min_freq=2)
+    with open("scripts/dict/word2idx.json", "w", encoding='utf-8') as f_save:
+        json.dump(word2idx, f_save, ensure_ascii=False, indent=2)
+    with open("scripts/dict/char2idx.json", "w", encoding='utf-8') as f_char:
+        json.dump(char2idx, f_char, ensure_ascii=False, indent=2)
+    print("[VOCAB] Saved word2idx.json and char2idx.json")
 
     tag2idx = {"<PAD>": 0, "O": 1, "B-LAW": 2, "I-LAW": 3, "B-ART": 4, "I-ART": 5}
     idx2tag = {v: k for k, v in tag2idx.items()}
