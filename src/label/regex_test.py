@@ -114,17 +114,15 @@ def load_existing_labeled(jsonl_files):
         return {}
         
     dfs = []
-    required_cols = ["file_name", "input", "citations"]
-    
     for f in jsonl_files:
         try:
             df = pl.read_ndjson(f)
             
-            for col in required_cols:
+            for col in ["file_name", "input", "citations"]:
                 if col not in df.columns:
                     df = df.with_columns(pl.lit(None).alias(col))
-            
-            df = df.select(required_cols)
+                    
+            df = df.select(["file_name", "input", "citations"])
             dfs.append(df)
         except Exception as e:
             print(f"Error reading {f}: {e}")
@@ -132,11 +130,7 @@ def load_existing_labeled(jsonl_files):
     if not dfs:
         return {}
         
-    try:
-        df = pl.concat(dfs)
-    except Exception as e:
-        print(f"Error concatenating dataframes: {e}")
-        return {}
+    df = pl.concat(dfs)
     
     df = df.with_columns(
         pl.when(pl.col("citations").is_not_null())
@@ -144,7 +138,6 @@ def load_existing_labeled(jsonl_files):
           .otherwise("")
           .alias("cit_str")
     )
-    
     df = df.with_columns(
         (pl.col("cit_str").str.lengths() > 2).alias("has_citations")
     )
