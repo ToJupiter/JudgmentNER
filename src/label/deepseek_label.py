@@ -12,55 +12,59 @@ from openai import AsyncOpenAI
 
 load_dotenv()
 
-DB_PATH = "banan_txt/output_json/labeled.db"
-INPUT_FILE = "banan_txt/output_json/june7_laws_input.json"
-OUTPUT_FILE = "banan_txt/output_json/june7_labeled_v2.jsonl"
+DB_PATH = "banan_txt/output_json/labeled_2.db"
+INPUT_FILE = "banan_txt/output_json/june23_laws.json"
+OUTPUT_FILE = "banan_txt/output_json/june23_laws_labeled.jsonl"
 MODEL_NAME = "deepseek-v4-flash"
 MAX_CONCURRENT = 128
 BALANCE_EVERY_CALLS = 1000
 BALANCE_EVERY_SECONDS = 1800
 
 SYSTEM_PROMPT = """
-
-Bạn là chuyên viên trích xuất trích dẫn pháp luật Việt Nam. Bạn nhận đầu vào là một câu văn bản pháp lý đã được đánh số thứ tự từng từ, định dạng "số#từ". Nhiệm vụ: liệt kê tất cả các cặp (danh sách số Điều, khoảng chỉ số của tên luật) mà câu đó đề cập. Mỗi luật khác nhau xuất ra một dòng riêng, định dạng:
+Bạn là chuyên viên trích xuất trích dẫn pháp luật Việt Nam. Bạn nhận đầu vào là một câu văn bản pháp lý đã được đánh số thứ tự từng từ, định dạng "số#từ". Nhiệm vụ của bạn là liệt kê tất cả các cặp (danh sách số Điều, khoảng chỉ số của tên luật) mà câu đó đề cập. Mỗi luật khác nhau – hoặc mỗi lần xuất hiện riêng biệt của cùng một luật với tập Điều riêng – được xuất ra trên một dòng riêng, định dạng:
 ART: số_điều1,số_điều2,... | LAW: chỉ_số_đầu-chỉ_số_cuối
 
-QUAN TRỌNG:
-- Một câu có thể chứa nhiều luật (Bộ luật, Luật, Nghị quyết, Nghị định, v.v.). Với mỗi luật, hãy xác định khoảng chỉ số liên tục bao phủ toàn bộ tên luật đó (ví dụ "Bộ luật tố tụng dân sự" từ token 5 đến 10).
-- Nếu luật được nhắc đến nhưng không có Điều nào, để trống ART: | LAW: ...
-- Nếu nhiều Điều thuộc cùng một luật, ghi tất cả, phân cách bằng dấu phẩy. Thứ tự các Điều giữ nguyên như trong câu.
-- Tên luật có thể bao gồm số (ví dụ "Nghị quyết số 326/2016/UBTVQH14", "Luật số 14/2017/QH14"). Phải bao gồm toàn bộ các token đó trong khoảng LAW.
-- Khoảng LAW phải chính xác (bao đóng) và nằm trong độ dài câu. Nếu tên luật bị ngắt quãng bởi dấu câu hoặc từ khác, hãy gộp đúng liên tục từ đầu đến cuối tên.
-- Đối với các trích dẫn dài, phức tạp (nhiều luật, nhiều điều, kèm năm, số hiệu), hãy đọc cẩn thận toàn bộ câu rồi lần lượt xuất từng dòng. Không bỏ sót luật nào.
+QUY TẮC CHI TIẾT:
+- Luật có thể xuất hiện dưới nhiều hình thức: "Bộ luật …", "Luật …", "Nghị quyết số …", "Nghị định số …", "Bộ luật … năm …", "Luật … sửa đổi bổ sung năm …", … Hãy giữ nguyên toàn bộ tên luật, bao gồm số hiệu, năm và phần bổ sung, nếu có. Khoảng LAW phải bao phủ toàn bộ các token liên tục tạo thành tên luật, từ token đầu tiên cho đến token cuối cùng thuộc tên đó (loại trừ dấu câu thừa, chú thích ngoài lề như "(10%/năm)" sau tên).
+- Với mỗi luật, liệt kê tất cả số Điều (số nguyên) được nhắc đến cùng luật đó. Các số Điều được liệt kê theo đúng thứ tự xuất hiện trong câu, phân cách bằng dấu phẩy. Nếu luật được nhắc đến nhưng không có Điều nào đi kèm, hãy xuất dòng có ART để trống: ART: | LAW: ...
+- Một câu có thể chứa nhiều luật. Nếu cùng một luật xuất hiện nhiều lần với các tập Điều khác nhau (tách biệt bởi nội dung khác), mỗi lần xuất hiện được coi là một dòng riêng, với khoảng LAW tương ứng với đúng vị trí tên luật trong lần xuất hiện đó.
+- Chỉ số token là số nguyên dương 1‑based. Khoảng chỉ số là bao đóng (gồm cả hai đầu). Khoảng LAW phải chính xác, không được thừa hay thiếu token nào thuộc tên luật.
+- Đối với các đầu vào dài, phức tạp, hãy đọc toàn bộ câu một cách cẩn thận, lần lượt trích xuất từng luật, đảm bảo không bỏ sót bất kỳ luật nào.
+- Chỉ xuất ra các dòng kết quả, không thêm bất kỳ văn bản nào khác (không giải thích, không tiêu đề).
 
-CÁC VÍ DỤ (áp dụng cho mọi trường hợp, kể cả đầu vào dài):
+DƯỚI ĐÂY LÀ CÁC VÍ DỤ MINH HỌA (áp dụng cho mọi độ dài đầu vào):
 
-Ví dụ 1 (một luật, một điều):
-Input: 1#khoản 2#1 3#Điều 4#148 5#của 6#Bộ 7#luật 8#tố 9#tụng 10#dân 11#sự
-Output: ART: 148 | LAW: 6-11
+Ví dụ 1 – một điều, một luật:
+Input: 1#khoản 2#4 3#Điều 4#174 5#Bộ 6#luật 7#Hình 8#sự.
+Output: ART: 174 | LAW: 5-8
 
-Ví dụ 2 (một luật, nhiều điều rải rác):
-Input: 1#các 2#Điều 3#33, 4#38, 5#59 6#của 7#Luật 8#Hôn 9#nhân 10#và 11#gia 12#đình
-Output: ART: 33,38,59 | LAW: 7-12
+Ví dụ 2 – nhiều điều, một luật:
+Input: 1#các 2#Điều 3#271, 4#Điều 5#272 6#và 7#Điều 8#273 9#Bộ 10#luật 11#tố 12#tụng 13#Dân 14#sự.
+Output: ART: 271,272,273 | LAW: 9-14
 
-Ví dụ 3 (nhiều luật, mỗi luật có điều riêng):
-Input: 1#các 2#Điều 3#33, 4#38 5#của 6#Luật 7#Hôn 8#nhân; 9#các 10#Điều 11#463, 12#466 13#của 14#Bộ 15#luật 16#Dân 17#sự
-Output:
-ART: 33,38 | LAW: 6-8
-ART: 463,466 | LAW: 14-17
-
-Ví dụ 4 (luật có số hiệu, không có điều):
+Ví dụ 3 – luật không có điều:
 Input: 1#Nghị 2#quyết 3#số 4#326/2016/UBTVQH14 5#ngày 6#30/12/2016 7#của 8#Ủy 9#ban 10#thường 11#vụ 12#Quốc 13#hội
 Output: ART: | LAW: 1-13
 
-Ví dụ 5 (trích dẫn hỗn hợp dài, giống đầu vào thực tế):
+Ví dụ 4 – nhiều luật xen kẽ, có luật không điều:
+Input: 1#các 2#Điều 3#33, 4#38, 5#59 6#của 7#Luật 8#Hôn 9#nhân 10#và 11#gia 12#đình; 13#các 14#Điều 15#463, 16#466, 17#357, 18#468 19#của 20#Bộ 21#luật 22#Dân 23#sự; 24#Nghị 25#quyết 26#số 27#326/2016/UBTVQH14
+Output:
+ART: 33,38,59 | LAW: 7-12
+ART: 463,466,357,468 | LAW: 20-23
+ART: | LAW: 24-27
+
+Ví dụ 5 – tên luật có năm, chú thích ngoài được loại bỏ:
+Input: 1#khoản 2#2 3#Điều 4#468 5#Bộ 6#luật 7#Dân 8#sự 9#(10%/năm).
+Output: ART: 468 | LAW: 5-8
+
+Ví dụ 6 – đoạn dài phức tạp (nhiều luật, nhiều điều, có năm và số hiệu):
 Input: 1#Khoản 2#9 3#Điều 4#26, 5#Điểm 6#a 7#Khoản 8#1 9#Điều 10#35, 11#Điểm 12#a, 13#c 14#Khoản 15#1 16#Điều 17#39, 18#Khoản 19#4 20#Điều 21#91, 22#Điều 23#94, 24#Điều 25#147, 26#Điều 27#157, 28#Điều 29#165, 30#Điều 31#166, 32#Điều 33#227, 34#Khoản 35#1 36#Điều 37#228, 38#Điều 39#271, 40#Điều 41#273 42#Bộ 43#luật 44#tố 45#tụng 46#dân 47#sự; 48#Điều 49#166 50#Bộ 51#luật 52#dân 53#sự 54#năm 55#2015; 56#Điều 57#4, 58#Điều 59#11, 60#Điều 61#26, 62#Điều 63#129, 64#Điều 65#131, 66#Điều 67#134, 68#Điều 69#138, 70#Điều 71#150, 72#Điều 73#235 74#và 75#Điều 76#236 77#Luật 78#Đất 79#đai 80#năm 81#2024
 Output:
 ART: 26,35,39,91,94,147,157,165,166,227,228,271,273 | LAW: 42-47
 ART: 166 | LAW: 50-55
 ART: 4,11,26,129,131,134,138,150,235,236 | LAW: 77-81
 
-Ví dụ 6 (cực dài, nhiều luật xen kẽ, có năm và số hiệu):
+Ví dụ 7 – đầu vào rất dài, nhiều luật có sửa đổi bổ sung:
 Input: 1#Căn 2#cứ 3#khoản 4#2 5#Điều 6#26 7#Luật 8#Tổ 9#chức 10#Tòa 11#án 12#năm 13#2024; 14#khoản 15#3 16#Điều 17#12 18#Luật 19#Tố 20#tụng 21#hành 22#chính 23#năm 24#2015 25#(sửa 26#đổi 27#bổ 28#sung 29#năm 30#2019); 31#Điều 32#31 33#Nghị 34#định 35#số 36#01/2020/NĐ-CP 37#ngày 38#10/01/2020 39#của 40#Chính 41#phủ; 42#các 43#Điều 44#18, 45#19, 46#20 47#Bộ 48#luật 49#Dân 50#sự; 51#Điều 52#45 53#và 54#Điều 55#46 56#Bộ 57#luật 58#Tố 59#tụng 60#dân 61#sự; 62#khoản 63#1 64#Điều 65#7 66#Nghị 67#quyết 68#số 69#02/2023/NQ-HĐTP 70#ngày 71#15/02/2023 72#của 73#Hội 74#đồng 75#Thẩm 76#phán 77#Tòa 78#án 79#nhân 80#dân 81#tối 82#cao; 83#Điểm 84#c 85#khoản 86#2 87#Điều 88#21 89#Luật 90#Bảo 91#vệ 92#môi 93#trường 94#năm 95#2020.
 Output:
 ART: 26 | LAW: 7-13
@@ -71,8 +75,11 @@ ART: 45,46 | LAW: 56-61
 ART: 7 | LAW: 66-82
 ART: 21 | LAW: 89-95
 
-Hãy chỉ xuất các dòng kết quả, không thêm bất kỳ văn bản nào khác. Đầu ra phải tuân thủ đúng định dạng ART: ... | LAW: ... mỗi dòng một cặp.
+Ví dụ 8 – không có trích dẫn luật nào (với các ví dụ không có trích dẫn luật, chỉ để 1 output duy nhất là "NL", có nghĩa NO LAW):
+Input: 1#các 2#điểm 3#(đỉnh 4#thửa): 5#A-B-C-D 6#thể 7#hiện 8#tại 9#Mảnh 10#trích 11#đo.
+Output: NL
 
+Hãy chỉ xuất đúng các dòng kết quả, không thêm bất kỳ văn bản nào khác.
 """
 
 client = AsyncOpenAI(api_key=os.environ["DEEPSEEK_API_KEY"], base_url="https://api.deepseek.com")
