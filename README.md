@@ -20,4 +20,5 @@ python cnn_training.py \
   --infer \
   --model_dir artifacts/legal_ner \
   --text "Căn cứ điểm a khoản 1 Điều 355, Điều 356 Bộ luật Tố tụng hình sự"
+  --cpu
 ```
